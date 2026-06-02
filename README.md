@@ -1,6 +1,6 @@
 # Voice Calling Agent
 
-AI-powered outbound voice agent that integrates with your existing **Asterisk / IPPBX / SIP / WebRTC** infrastructure. The agent dials your customers, holds a natural conversation using an LLM grounded on documents you upload, and hands off to a human when needed.
+AI-powered outbound voice agent that registers as a **SIP extension** on your PBX (via PJSIP/pjsua2) and places calls directly — no Asterisk required. The agent dials your customers, holds a natural conversation using an LLM grounded on documents you upload, and hands off to a human when needed.
 
 ---
 
@@ -11,7 +11,7 @@ AI-powered outbound voice agent that integrates with your existing **Asterisk / 
 3. [Prerequisites](#prerequisites)
 4. [Installation](#installation)
 5. [Configuration](#configuration)
-6. [Asterisk Integration](#asterisk-integration)
+6. [SIP Integration](#sip-integration)
 7. [API Reference](#api-reference)
 8. [End-to-end walkthrough](#end-to-end-walkthrough)
 9. [Operational notes](#operational-notes)
@@ -22,77 +22,71 @@ AI-powered outbound voice agent that integrates with your existing **Asterisk / 
 
 ## What this service does
 
-This service runs **alongside your existing Asterisk** and uses the **Asterisk REST Interface (ARI)** to:
+This service registers as a **SIP extension on your PBX** (like a softphone) and uses it to:
 
-- Originate outbound calls through your existing SIP trunks
-- Bridge the customer's audio into a streaming AI loop (STT → LLM → TTS)
+- Originate outbound calls through your PBX's existing trunks
+- Stream the caller's audio into an AI loop (STT → LLM → TTS)
 - Maintain natural, interruptible conversation
 - Use a knowledge base (PDF / DOCX / URL) for accurate, grounded answers
 - Transfer to a human agent on request
 - Save transcripts and fire webhooks back to your CRM
 
-It does **not replace** your IPPBX, dialplan, or WebRTC frontend — it plugs into them. Your existing inbound flows, queues, IVR, and softphones continue to work unchanged.
+It does **not replace** your PBX — it plugs into it as just another registered extension. Your existing inbound flows, queues, IVR, and softphones continue to work unchanged.
 
 ## Architecture
 
 ```
-                      ┌────────────────────────────────────┐
-                      │   YOUR EXISTING SYSTEM             │
-                      │   (Asterisk + IPPBX + WebRTC)      │
-                      │                                    │
-   PSTN  ◄──SIP──►   │   PJSIP Trunks                     │
-                      │   Dialplan / Queues / IVR          │
-                      │                                    │
-                      └──────────┬─────────────────────────┘
-                                 │ ARI (HTTP + WS) on :8088
-                                 │ + RTP externalMedia (UDP)
-                                 ▼
-        ┌───────────────────────────────────────────────────┐
-        │   VOICE CALLING AGENT (this service)              │
-        │                                                   │
-        │   FastAPI ──► CallManager ──► CallSession         │
-        │                                  │                │
-        │                                  ▼                │
-        │   STT (Deepgram) ──► ConversationEngine           │
-        │                       │   (LLM + RAG)             │
-        │                       ▼                           │
-        │   TTS (ElevenLabs) ──► RTP back to Asterisk       │
-        │                                                   │
-        │   MongoDB (agents, calls, transcripts)            │
-        │   Qdrant (knowledge base embeddings)              │
-        └───────────────────────────────────────────────────┘
-                                 ▲
-                                 │ REST API
-                                 │
-                      ┌──────────┴──────────┐
-                      │  Your CRM / Backend │
-                      └─────────────────────┘
+   PSTN / mobiles
+        ▲
+        │ SIP + RTP
+        ▼
+   ┌─────────────────────┐
+   │   YOUR PBX          │   (e.g. 15.207.28.98:7719)
+   │   extensions/trunks │
+   └──────────┬──────────┘
+              │ SIP REGISTER (as an extension) + RTP audio
+              ▼
+   ┌───────────────────────────────────────────────────┐
+   │   VOICE CALLING AGENT (this service)              │
+   │                                                   │
+   │   FastAPI ──► SIPCallManager ──► SIPCallSession   │
+   │                       (PJSIP / pjsua2)            │
+   │                                  │                │
+   │                                  ▼                │
+   │   STT (Deepgram) ──► ConversationEngine           │
+   │                       │   (LLM + RAG)             │
+   │                       ▼                           │
+   │   TTS (ElevenLabs) ──► RTP back to the caller     │
+   │                                                   │
+   │   MongoDB (agents, calls, transcripts)            │
+   │   Qdrant (knowledge base embeddings)              │
+   └───────────────────────────────────────────────────┘
+              ▲
+              │ REST API
+       ┌──────┴──────┐
+       │ CRM/Backend │
+       └─────────────┘
 ```
 
-**Key idea:** Asterisk ARI's `externalMedia` channel exposes raw RTP audio (`slin16` = 16-bit PCM @ 16 kHz) to a UDP socket on this service. We decode the inbound audio, feed it into a streaming STT, run the LLM with knowledge base retrieval, synthesize the reply, and send PCM back via RTP. Asterisk handles the actual SIP signalling and PSTN connectivity through your existing trunks.
+**Key idea:** the service uses **PJSIP/pjsua2** to register itself as a SIP extension on your PBX — exactly like a softphone. To place a call it sends an INVITE through the PBX (which handles PSTN routing through your trunks). PJSIP negotiates the codec (usually 8 kHz G.711) and resamples to the agent's internal 16 kHz PCM. We feed inbound audio to streaming STT, run the LLM with knowledge-base retrieval, synthesize the reply, and stream PCM back over RTP. No Asterisk/ARI required.
+
+See **[docs/SIP_SETUP.md](docs/SIP_SETUP.md)** for the full SIP build/setup guide.
 
 ---
 
 ## Prerequisites
 
-You already have, per your message:
-
-- ✅ Asterisk with IPPBX and dialplan
-- ✅ SIP trunk(s) for PSTN connectivity
-- ✅ WebRTC frontend
-
-You additionally need:
-
 | Component | Purpose | Notes |
 |-----------|---------|-------|
-| **Asterisk 16+** with ARI enabled | Channel control & media bridging | Required modules: `res_ari`, `res_stasis`, `res_rtp_asterisk` |
+| **A SIP account** (extension + password + domain) | Registers the agent on your PBX | Softphone-style credentials; one registration per extension |
+| **PJSIP with Python bindings (pjsua2)** | SIP signalling + RTP/codec handling | Native build — see [docs/SIP_SETUP.md](docs/SIP_SETUP.md) |
 | **MongoDB 5+** | Stores agents, calls, transcripts | Can run on the same host |
 | **Qdrant 1.7+** | Vector store for KB embeddings | Or swap for Weaviate/Pinecone |
 | **Python 3.11+** | Runtime | Or use the provided Docker setup |
 | **OpenAI API key** | LLM + embeddings | GPT-4o-mini works well; GPT-4o for best quality |
 | **Deepgram API key** | Real-time STT | Cheaper/faster than Whisper streaming |
 | **ElevenLabs API key** | TTS | Or use OpenAI TTS as fallback |
-| **Network reachability** | Asterisk → this service over ARI (TCP 8088) and RTP (UDP) | Same VLAN strongly recommended |
+| **Network reachability** | Agent → PBX over SIP (UDP/TCP) and RTP (UDP) | Same network as the PBX strongly recommended |
 
 ---
 
@@ -104,11 +98,11 @@ You additionally need:
 git clone <this-repo> voice-agent
 cd voice-agent
 cp .env.example .env
-# Edit .env with your credentials and Asterisk address
+# Edit .env with your SIP account + AI provider keys
 docker-compose up -d
 ```
 
-Three containers come up: the agent, MongoDB, Qdrant. The agent uses `network_mode: host` so the RTP UDP ports on the host are reachable from Asterisk.
+Three containers come up: the agent, MongoDB, Qdrant. The agent uses `network_mode: host` so SIP/RTP UDP ports are reachable to/from the PBX. (Note: pjsua2 must be built into the image — see the Dockerfile notes in [docs/SIP_SETUP.md](docs/SIP_SETUP.md).)
 
 ### Option B — Bare metal
 
@@ -144,20 +138,16 @@ curl http://localhost:8000/health
 All settings live in `.env`. The most important values:
 
 ```bash
-# Where to find YOUR Asterisk
-ARI_URL=http://10.0.0.5:8088
-ARI_USERNAME=asterisk
-ARI_PASSWORD=match-the-asterisk-config
-ARI_APP_NAME=voice-agent       # Stasis app name; pick anything, must match dialplan
+# SIP account — registers the agent on your PBX (softphone-style credentials)
+SIP_DOMAIN=15.207.28.98:7719   # SIP server host:port
+SIP_USERNAME=1055              # extension
+SIP_PASSWORD=your-password
+SIP_TRANSPORT=udp
+SIP_LOCAL_PORT=5060
 
-# Default trunk (the PJSIP endpoint name in your pjsip.conf)
-DEFAULT_TRUNK=my-sip-provider
-
-# Where Asterisk should send RTP audio for AI processing
-# If agent is on same host as Asterisk: 127.0.0.1
-# If on a different host: this server's IP that Asterisk can reach
-MEDIA_HOST=10.0.0.10
-MEDIA_PORT_START=10000
+# Outbound number formatting for the PBX dialplan
+SIP_DIAL_STRIP_CC=91           # strip leading country code (this PBX wants 10-digit)
+SIP_DIAL_PREFIX=               # add a trunk prefix here if your PBX needs one
 
 # AI providers
 OPENAI_API_KEY=sk-...
@@ -167,69 +157,29 @@ ELEVENLABS_API_KEY=...
 
 ---
 
-## Asterisk Integration
+## SIP Integration
 
-You need to make **three small additions** to your existing Asterisk config. None of them disturb your current dialplan.
+This service registers itself as a **SIP extension** on your PBX (like a softphone), so there is **no Asterisk/ARI config to add** — you only need valid SIP credentials.
 
-### 1. Enable ARI
-
-`/etc/asterisk/ari.conf`:
-
-```ini
-[general]
-enabled = yes
-pretty = yes
-allowed_origins = *
-
-[asterisk]
-type = user
-read_only = no
-password = change-me-to-match-env-ARI_PASSWORD
-password_format = plain
-```
-
-### 2. Enable HTTP server (ARI rides on it)
-
-`/etc/asterisk/http.conf`:
-
-```ini
-[general]
-enabled = yes
-bindaddr = 0.0.0.0
-bindport = 8088
-```
-
-### 3. (Optional) Add a dialplan extension to test inbound
-
-`/etc/asterisk/extensions.conf`:
-
-```ini
-[from-internal]
-exten => 9999,1,NoOp(Connecting to Voice Agent)
- same => n,Answer()
- same => n,Stasis(voice-agent,inbound_${UNIQUEID})
- same => n,Hangup()
-```
-
-Reload:
+1. **Install PJSIP/pjsua2** (native build) — see [docs/SIP_SETUP.md](docs/SIP_SETUP.md).
+2. **Put your SIP account in `.env`** (`SIP_DOMAIN`, `SIP_USERNAME`, `SIP_PASSWORD`).
+3. **Confirm registration + a test call:**
 
 ```bash
-asterisk -rx "module reload res_ari.so"
-asterisk -rx "module reload res_stasis.so"
-asterisk -rx "dialplan reload"
-asterisk -rx "ari show apps"   # should list 'voice-agent' once the service connects
+.venv/bin/python scripts/sip_smoketest.py <number>
+# Look for: [reg] active=True code=200, then [call] ✅ media is ACTIVE
 ```
 
-> **Outbound calls do not require any dialplan changes.** The service uses ARI's `originate` method, which dials directly through `PJSIP/<number>@<trunk>` and drops the answered channel into the Stasis app — bypassing the dialplan entirely.
+> **Number format:** PBXs differ on what they route. If a call returns `404 Not Found`, the dialed string didn't match the dialplan — adjust `SIP_DIAL_STRIP_CC` / `SIP_DIAL_PREFIX`. Dial whatever format works from your softphone.
+
+> **One registration per extension:** while the agent is registered as an extension, a softphone logged in as the same extension may be kicked offline. Use a dedicated extension for the agent when possible.
 
 ### Network / firewall
 
 | Direction | Port | Protocol | Purpose |
 |-----------|------|----------|---------|
-| Agent → Asterisk | 8088 | TCP | ARI HTTP + WebSocket |
-| Asterisk → Agent | 10000-10500 | UDP | RTP externalMedia audio |
-
-The full snippet file is at `config/asterisk-snippets.conf`.
+| Agent ↔ PBX | 5060 (or `SIP_LOCAL_PORT`) | UDP/TCP | SIP signalling |
+| Agent ↔ PBX | RTP range | UDP | Call audio |
 
 ---
 
@@ -463,7 +413,6 @@ curl -X POST http://localhost:8000/api/v1/calls/outbound \
   -d '{
     "agent_id": "agent_abc",
     "destination": "+919812345678",
-    "trunk": "my-sip-provider",
     "variables": {"customer_name": "Rahul"}
   }'
 # → {"call_id": "call_xyz", "status": "initiated", ...}
@@ -472,11 +421,8 @@ curl -X POST http://localhost:8000/api/v1/calls/outbound \
 ### Step 5 — Watch what happens
 
 ```bash
-# Server logs
+# Server logs (SIP signalling + STT/LLM/TTS)
 docker logs -f voice-agent
-
-# Asterisk console
-asterisk -rvvv
 
 # Final transcript
 curl http://localhost:8000/api/v1/calls/call_xyz | jq '.transcript'
@@ -509,7 +455,7 @@ Each active call uses:
 - 1 UDP socket for RTP
 - ~50 MB RAM
 
-A single instance comfortably handles ~50 concurrent calls on a 4-core / 8 GB box. Scale horizontally by running multiple instances behind a load-balanced ARI app — Asterisk's `Stasis` will distribute newly-arriving channels across them.
+A single instance handles a modest number of concurrent calls (bounded by `maxCalls` in the PJSIP endpoint config and your CPU). Scale horizontally by running multiple instances, each registered as its own extension, and distributing targets across them.
 
 ### Cost (rough, USD)
 
@@ -521,41 +467,32 @@ For a typical 3-minute call:
 
 ### Recording
 
-Add an ARI recording call to `CallSession.start()` if you need recordings:
-
-```python
-await self.ari.post(f"/channels/{self.channel_id}/record", params={
-    "name": f"call-{self.call_id}",
-    "format": "wav",
-    "maxDurationSeconds": self.config.max_call_duration,
-})
-```
-
-Recordings land in `/var/spool/asterisk/recording/` by default.
+The agent already has both audio streams in `SIPCallSession` (inbound PCM via
+`on_inbound_pcm`, outbound PCM via `_send`). To record, tee those 16 kHz PCM
+buffers to a WAV file and store the path on the call record (`recording_path`),
+which the `GET /calls/{id}/recording` endpoint already serves.
 
 ---
 
 ## Troubleshooting
 
-### "Connected to ARI but no calls go through"
+### "Registration fails (401/403) or times out (408)"
 
-Check that the Stasis app shows up:
+- `401/403` → wrong `SIP_USERNAME` / `SIP_PASSWORD`.
+- `408` (timeout) → the agent can't reach `SIP_DOMAIN`; check network/firewall to the PBX host:port.
+- Run `scripts/sip_smoketest.py` and read the `[reg]` line.
 
-```bash
-asterisk -rx "ari show apps"
-# Should list: voice-agent
-```
+### "Call returns 404 Not Found"
 
-If it doesn't, the agent failed to subscribe. Check the agent logs for the WebSocket connection error and verify `ARI_PASSWORD` matches `/etc/asterisk/ari.conf`.
+The PBX has no route for the dialed string — a dialplan/format issue, not a bug. Dial whatever format works from your softphone, and set `SIP_DIAL_STRIP_CC` / `SIP_DIAL_PREFIX` to match.
 
 ### "Call connects but no audio / one-way audio"
 
-This is almost always RTP routing:
+Almost always RTP routing/NAT:
 
-1. Confirm `MEDIA_HOST` in `.env` is reachable from Asterisk
-2. Confirm UDP ports 10000-10500 (or whatever range you set) are open between Asterisk and the agent
-3. If running in Docker, the agent container **must** use `network_mode: host` (or you must publish the UDP range)
-4. Check Asterisk logs: `pjsip set logger on` then `rtp set debug on`
+1. Run the agent on the same network as the PBX, or ensure RTP UDP ports are reachable both ways.
+2. If running in Docker, the agent container **must** use `network_mode: host` (or publish the SIP/RTP UDP ports).
+3. Confirm the negotiated codec — the PBX should offer G.711 (PCMU/PCMA); PJSIP resamples to 16 kHz internally.
 
 ### "Agent talks too fast / cuts itself off"
 
@@ -571,21 +508,16 @@ Tweak in `agent/conversation_engine.py`:
 - If retrieved chunks are wrong, tune `chunk_size`/`chunk_overlap` (smaller chunks for FAQ-style content, larger for narrative documents)
 - Consider switching to `text-embedding-3-large` for better recall on multilingual content
 
-### "ARI events not arriving"
+### "Registration drops after a while"
 
-Check that the WS connection stays open: `netstat -an | grep 8088`. The client auto-reconnects on drop, but if your Asterisk is behind a proxy that closes idle sockets, configure ARI keepalive in `ari.conf`:
-
-```ini
-[general]
-websocket_write_timeout = 300
-```
+The agent re-registers automatically before expiry. If it keeps dropping, the PBX may only allow one registration per extension and another device (e.g. a softphone) is logging in as the same extension — give the agent its own extension.
 
 ---
 
 ## Security
 
 - **Never expose port 8000 to the public internet.** Put it behind your existing reverse proxy with auth.
-- **Restrict ARI access** by binding `bindaddr` in `http.conf` to an internal interface and using firewall rules.
+- **Keep SIP credentials in `.env` only** and restrict who can read it; the agent's extension can place real (billable) calls.
 - **Use webhook HMAC verification** in your CRM to confirm post-call payloads originated from this service.
 - **Rotate API keys** for OpenAI / Deepgram / ElevenLabs regularly.
 - **GDPR / DPDP / TCPA compliance** is your responsibility — make sure you have consent before placing automated calls and that the agent identifies itself appropriately. The `base_instructions` is the right place to enforce this (e.g. *"Always start by saying: 'This is an automated call from ABC Corp.'"*).
@@ -611,10 +543,10 @@ voice-agent/
 │   │   ├── stt_provider.py           # Deepgram / Whisper / Google
 │   │   └── tts_provider.py           # ElevenLabs / OpenAI / Azure
 │   ├── sip/
-│   │   ├── ari_client.py             # Asterisk ARI WS client
-│   │   ├── call_manager.py           # Channel/bridge orchestration
-│   │   ├── call_session.py           # Per-call audio loop
-│   │   ├── rtp_handler.py            # UDP RTP I/O
+│   │   ├── pjsip_client.py           # PJSIP/pjsua2 endpoint, registration, dialing, audio tap
+│   │   ├── sip_backend.py            # Telephony backend (app.state.telephony)
+│   │   ├── sip_call_manager.py       # Outbound call orchestration
+│   │   ├── sip_call_session.py       # Per-call STT→LLM→TTS audio loop
 │   │   └── dialer.py                 # Bulk campaign engine
 │   ├── kb/
 │   │   ├── document_processor.py     # PDF/DOCX/HTML extraction
@@ -623,8 +555,10 @@ voice-agent/
 │       ├── db.py                     # MongoDB
 │       ├── logger.py
 │       └── webhook.py                # HMAC-signed outbound webhooks
-├── config/
-│   └── asterisk-snippets.conf        # Drop-in Asterisk config
+├── docs/
+│   └── SIP_SETUP.md                  # PJSIP build + SIP setup guide
+├── scripts/
+│   └── sip_smoketest.py              # Register + dial + audio test (no AI)
 ├── examples/
 │   └── python_client.py              # End-to-end client example
 ├── docker-compose.yml
