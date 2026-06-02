@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+  voice-agent:
+    build: .
+    container_name: voice-agent
+    restart: unless-stopped
+    network_mode: host  # so SIP/RTP UDP ports are reachable to/from the PBX
+    env_file: .env
+    volumes:
+      - ./uploads:/var/voice-agent/uploads
+      - ./logs:/var/log/voice-agent
+    depends_on:
+      - mongo
+      - qdrant
+
+  mongo:
+    image: mongo:7
+    container_name: voice-agent-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: voice-agent-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant-data:/qdrant/storage
+
+volumes:
+  mongo-data:
+  qdrant-data:
