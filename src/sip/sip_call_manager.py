@@ -105,6 +105,7 @@ class SIPCallManager:
                         "ended_at": ended,
                         "duration_seconds": duration,
                         "transcript": transcript,
+                        "turn_count": len(transcript),
                         "outcome": session.outcome,
                     }},
                 )

@@ -28,6 +28,17 @@ async def lifespan(app: FastAPI):
     # Initialize database
     await init_db()
 
+    # Validate configuration against the agents that are actually defined,
+    # so missing keys surface at startup (not mid-call).
+    from utils.config_check import log_startup_config
+    from utils.db import db_available, get_db_instance
+    if db_available():
+        agent_dicts = [a async for a in get_db_instance().agents.find({})]
+    else:
+        from utils.agent_store import list_agents
+        agent_dicts = list_agents()
+    log_startup_config(agent_dicts)
+
     # Initialize vector store for knowledge base
     app.state.vector_store = VectorStoreManager()
     await app.state.vector_store.initialize()

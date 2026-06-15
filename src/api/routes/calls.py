@@ -10,6 +10,9 @@ from pydantic import BaseModel, Field
 from utils.db import get_db
 from sip.sip_call_manager import SIPCallManager
 
+import logging
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
 
 
@@ -35,16 +38,25 @@ class OutboundCallRequest(BaseModel):
 
 
 class CallResponse(BaseModel):
-    call_id: str
-    channel_id: str
+    # Records store the id under "id" in Mongo; accept that on input but always
+    # expose it as "call_id" on output (stable contract for the frontend).
+    model_config = {"populate_by_name": True}
+    call_id: str = Field(..., validation_alias="id", serialization_alias="call_id")
+    channel_id: Optional[str] = None
     agent_id: str
-    destination: str
+    agent_name: Optional[str] = None
+    destination: str                       # the phone number
+    caller_id: Optional[str] = None
+    direction: Optional[str] = "outbound"
     status: str  # initiated | ringing | answered | completed | failed
     started_at: datetime
     ended_at: Optional[datetime] = None
     duration_seconds: Optional[int] = None
-    transcript: Optional[List[Dict[str, str]]] = None
+    turn_count: Optional[int] = None
+    transcript: Optional[List[Dict[str, Any]]] = None  # [{role, content, at}]
     outcome: Optional[str] = None
+    variables: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 @router.post("/outbound", response_model=CallResponse, status_code=201)
@@ -75,6 +87,29 @@ async def make_outbound_call(payload: OutboundCallRequest, request: Request, db=
     call_id = f"call_{uuid4().hex[:12]}"
     call_manager: SIPCallManager = request.app.state.telephony.call_manager
 
+    record = {
+        "id": call_id,
+        "channel_id": None,
+        "agent_id": payload.agent_id,
+        "agent_name": agent.get("name"),          # denormalized for UI lists
+        "destination": payload.destination,        # the phone number called
+        "caller_id": payload.caller_id,
+        "trunk": payload.trunk,
+        "variables": payload.variables,
+        "metadata": payload.metadata,
+        "direction": "outbound",
+        "status": "initiated",
+        "started_at": datetime.utcnow(),
+        "ended_at": None,
+        "duration_seconds": None,
+        "transcript": [],
+        "turn_count": 0,
+        "outcome": None,
+    }
+    # Persist FIRST so even a failed dial attempt shows up in call history.
+    if db is not None:
+        await db.calls.insert_one(record)
+
     try:
         channel_id = await call_manager.originate_call(
             call_id=call_id,
@@ -84,28 +119,20 @@ async def make_outbound_call(payload: OutboundCallRequest, request: Request, db=
             agent_config=agent,
             variables=payload.variables,
         )
+        record["channel_id"] = channel_id
+        if db is not None:
+            await db.calls.update_one(
+                {"id": call_id}, {"$set": {"channel_id": channel_id}}
+            )
     except Exception as e:
+        # Mark the attempt as failed (kept in history) and report the reason.
+        if db is not None:
+            await db.calls.update_one(
+                {"id": call_id},
+                {"$set": {"status": "failed", "outcome": "originate_failed",
+                          "error": str(e), "ended_at": datetime.utcnow()}},
+            )
         raise HTTPException(500, f"Failed to originate call: {e}")
-
-    record = {
-        "id": call_id,
-        "channel_id": channel_id,
-        "agent_id": payload.agent_id,
-        "destination": payload.destination,
-        "caller_id": payload.caller_id,
-        "trunk": payload.trunk,
-        "variables": payload.variables,
-        "metadata": payload.metadata,
-        "status": "initiated",
-        "started_at": datetime.utcnow(),
-        "ended_at": None,
-        "duration_seconds": None,
-        "transcript": [],
-        "outcome": None,
-    }
-    # Persist the call record only when a DB is configured.
-    if db is not None:
-        await db.calls.insert_one(record)
     return CallResponse(**record)
 
 
@@ -157,7 +184,14 @@ async def list_calls(
     if status:
         query["status"] = status
     cursor = db.calls.find(query).sort("started_at", -1).limit(limit)
-    return [CallResponse(**d) async for d in cursor]
+    out = []
+    async for d in cursor:
+        try:
+            out.append(CallResponse(**d))
+        except Exception:
+            # Skip any malformed/legacy record rather than failing the whole list.
+            logger.warning(f"Skipping unparseable call record {d.get('id')}")
+    return out
 
 
 @router.post("/{call_id}/hangup")

@@ -58,8 +58,7 @@ It does **not replace** your PBX — it plugs into it as just another registered
    │                       ▼                           │
    │   TTS (ElevenLabs) ──► RTP back to the caller     │
    │                                                   │
-   │   MongoDB (agents, calls, transcripts)            │
-   │   Qdrant (knowledge base embeddings)              │
+   │   MongoDB (agents, calls, transcripts, KB embeddings) │
    └───────────────────────────────────────────────────┘
               ▲
               │ REST API
@@ -80,8 +79,7 @@ See **[docs/SIP_SETUP.md](docs/SIP_SETUP.md)** for the full SIP build/setup guid
 |-----------|---------|-------|
 | **A SIP account** (extension + password + domain) | Registers the agent on your PBX | Softphone-style credentials; one registration per extension |
 | **PJSIP with Python bindings (pjsua2)** | SIP signalling + RTP/codec handling | Native build — see [docs/SIP_SETUP.md](docs/SIP_SETUP.md) |
-| **MongoDB 5+** | Stores agents, calls, transcripts | Can run on the same host |
-| **Qdrant 1.7+** | Vector store for KB embeddings | Or swap for Weaviate/Pinecone |
+| **MongoDB 5+ (or Atlas)** | Stores agents, calls, transcripts, AND KB embeddings | No separate vector DB needed |
 | **Python 3.11+** | Runtime | Or use the provided Docker setup |
 | **OpenAI API key** | LLM + embeddings | GPT-4o-mini works well; GPT-4o for best quality |
 | **Deepgram API key** | Real-time STT | Cheaper/faster than Whisper streaming |
@@ -102,7 +100,7 @@ cp .env.example .env
 docker-compose up -d
 ```
 
-Three containers come up: the agent, MongoDB, Qdrant. The agent uses `network_mode: host` so SIP/RTP UDP ports are reachable to/from the PBX. (Note: pjsua2 must be built into the image — see the Dockerfile notes in [docs/SIP_SETUP.md](docs/SIP_SETUP.md).)
+The agent container uses `network_mode: host` so SIP/RTP UDP ports are reachable to/from the PBX. MongoDB is MongoDB Atlas by default (set `MONGO_URL` in `.env`); KB embeddings are stored in Mongo too, so there's no separate vector DB. (Note: pjsua2 must be built into the image — see the Dockerfile notes in [docs/SIP_SETUP.md](docs/SIP_SETUP.md).)
 
 ### Option B — Bare metal
 
@@ -115,9 +113,9 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env
 
-# Start MongoDB and Qdrant separately
-docker run -d -p 27017:27017 mongo:7
-docker run -d -p 6333:6333 qdrant/qdrant
+# MongoDB: use MongoDB Atlas (set MONGO_URL in .env) — recommended.
+# Or run a local MongoDB:  docker run -d -p 27017:27017 mongo:7
+# (KB embeddings live in Mongo; no separate vector DB needed.)
 
 # Start the agent
 export PYTHONPATH=$(pwd)/src
@@ -550,7 +548,7 @@ voice-agent/
 │   │   └── dialer.py                 # Bulk campaign engine
 │   ├── kb/
 │   │   ├── document_processor.py     # PDF/DOCX/HTML extraction
-│   │   └── vector_store.py           # Qdrant + embeddings
+│   │   └── vector_store.py           # MongoDB-backed embeddings + cosine search
 │   └── utils/
 │       ├── db.py                     # MongoDB
 │       ├── logger.py

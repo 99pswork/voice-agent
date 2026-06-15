@@ -49,5 +49,16 @@ class SIPBackend:
             )
 
     async def disconnect(self):
+        # Drain live calls first so callers get a clean goodbye/hangup rather
+        # than a dead line when the service stops.
+        if self.call_manager and self.call_manager.sessions:
+            active = list(self.call_manager.sessions.keys())
+            logger.info(f"Draining {len(active)} active call(s) before shutdown")
+            for call_id in active:
+                try:
+                    await self.call_manager.hangup(call_id)
+                except Exception:
+                    logger.exception(f"Error hanging up {call_id} during shutdown")
+            await asyncio.sleep(0.5)  # let BYE/teardown flush
         if self.client:
             await asyncio.to_thread(self.client.shutdown)

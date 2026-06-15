@@ -10,29 +10,19 @@ services:
     volumes:
       - ./uploads:/var/voice-agent/uploads
       - ./logs:/var/log/voice-agent
-    depends_on:
-      - mongo
-      - qdrant
+    # No depends_on: MongoDB is MongoDB Atlas (set MONGO_URL in .env), and
+    # embeddings live in Mongo too — there is no separate vector DB to run.
+    # If you prefer a LOCAL MongoDB instead of Atlas, uncomment the `mongo`
+    # service below and set MONGO_URL=mongodb://localhost:27017 in .env.
 
-  mongo:
-    image: mongo:7
-    container_name: voice-agent-mongo
-    restart: unless-stopped
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongo-data:/data/db
+  # mongo:
+  #   image: mongo:7
+  #   container_name: voice-agent-mongo
+  #   restart: unless-stopped
+  #   ports:
+  #     - "27017:27017"
+  #   volumes:
+  #     - mongo-data:/data/db
 
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: voice-agent-qdrant
-    restart: unless-stopped
-    ports:
-      - "6333:6333"
-      - "6334:6334"
-    volumes:
-      - qdrant-data:/qdrant/storage
-
-volumes:
-  mongo-data:
-  qdrant-data:
+# volumes:
+#   mongo-data:

@@ -69,12 +69,18 @@ class _AudioBridgePort(pj.AudioMediaPort if PJSUA2_AVAILABLE else object):
     never call into asyncio directly here except via thread-safe primitives.
     """
 
+    # Small jitter buffer: wait until this many ms of audio is queued before we
+    # start emitting, so bursty TTS arrival doesn't cause underruns mid-speech.
+    # 3 frames (~60ms) balances smoothness against start latency.
+    _JITTER_PREBUFFER_FRAMES = 3  # ~60ms
+
     def __init__(self):
         super().__init__()
         self.on_inbound_pcm: Optional[Callable[[bytes], None]] = None
         # Outbound PCM bytes queued by the asyncio side; drained per frame.
         self._outbound = bytearray()
         self._outbound_lock = threading.Lock()
+        self._playing = False  # True once prebuffer filled; False when drained
 
     def createPort(self, name: str):
         """Create the underlying media port at the agent clock rate."""
@@ -103,21 +109,42 @@ class _AudioBridgePort(pj.AudioMediaPort if PJSUA2_AVAILABLE else object):
     def flush_outbound(self):
         with self._outbound_lock:
             self._outbound.clear()
+            self._playing = False
 
     def onFrameRequested(self, frame):  # noqa: N802
-        """PJSIP wants a frame to send to the remote party."""
+        """
+        PJSIP wants one 20ms frame to send to the remote party.
+
+        Pacing rules that prevent the choppy/breaking audio:
+          - Don't start playing until a small jitter prebuffer has accumulated,
+            so bursty TTS arrival doesn't underrun mid-word.
+          - NEVER discard a partial frame: if <1 frame remains, emit silence but
+            KEEP the leftover bytes for the next frame (the old code cleared them,
+            which dropped audio every sentence boundary).
+        """
         try:
             frame.type = pj.PJMEDIA_FRAME_TYPE_AUDIO
             with self._outbound_lock:
-                if len(self._outbound) >= BYTES_PER_FRAME:
+                buffered = len(self._outbound)
+
+                if not self._playing:
+                    # Hold (silence) until we have enough to play smoothly.
+                    if buffered >= self._JITTER_PREBUFFER_FRAMES * BYTES_PER_FRAME:
+                        self._playing = True
+                    else:
+                        chunk = b"\x00" * BYTES_PER_FRAME
+                        frame.buf = pj.ByteVector(chunk)
+                        frame.size = len(chunk)
+                        return
+
+                if buffered >= BYTES_PER_FRAME:
                     chunk = bytes(self._outbound[:BYTES_PER_FRAME])
                     del self._outbound[:BYTES_PER_FRAME]
                 else:
-                    # underrun -> send silence so the call stays comfortable
-                    chunk = bytes(self._outbound) + b"\x00" * (
-                        BYTES_PER_FRAME - len(self._outbound)
-                    )
-                    self._outbound.clear()
+                    # Underrun: emit silence but PRESERVE the partial bytes; once
+                    # more TTS arrives they continue seamlessly. Re-arm prebuffer.
+                    chunk = b"\x00" * BYTES_PER_FRAME
+                    self._playing = False
             frame.buf = pj.ByteVector(chunk)
             frame.size = len(chunk)
         except Exception:
@@ -135,10 +162,20 @@ class _AgentCall(pj.Call if PJSUA2_AVAILABLE else object):
         self._on_connected = on_connected
         self._on_disconnected = on_disconnected
         self._audio_connected = False
+        self._answered = False
 
     def onCallState(self, prm):  # noqa: N802
         ci = self.getInfo()
         logger.info(f"SIP call state: {ci.stateText} ({ci.lastStatusCode})")
+        # The greeting must only start once the callee has actually ANSWERED
+        # (CONFIRMED), not during early media / ringing — otherwise the opener
+        # plays before the person is on the line and they miss it.
+        if ci.state == pj.PJSIP_INV_STATE_CONFIRMED and not self._answered:
+            self._answered = True
+            try:
+                self._on_connected()
+            except Exception:
+                logger.exception("on_connected error")
         if ci.state == pj.PJSIP_INV_STATE_DISCONNECTED:
             try:
                 self._on_disconnected(ci.lastStatusCode)
@@ -157,12 +194,10 @@ class _AgentCall(pj.Call if PJSUA2_AVAILABLE else object):
                 # remote -> bridge (inbound) and bridge -> remote (outbound)
                 call_audio.startTransmit(self.bridge)
                 self.bridge.startTransmit(call_audio)
-                if not self._audio_connected:
-                    self._audio_connected = True
-                    try:
-                        self._on_connected()
-                    except Exception:
-                        logger.exception("on_connected error")
+                self._audio_connected = True
+                # NOTE: the conversation (greeting) is started from onCallState
+                # on CONFIRMED (answered), not here — see _answered. Media may go
+                # active during early media/ringing, which is too soon to greet.
 
     def queue_outbound(self, pcm: bytes):
         self.bridge.queue_outbound(pcm)

@@ -20,12 +20,15 @@ class AgentCreate(BaseModel):
         description="System prompt / persona / behavior rules for the agent",
         min_length=10,
     )
-    voice: str = Field("alloy", description="TTS voice: alloy, echo, fable, onyx, nova, shimmer, or custom")
+    # Default to the production voice stack so a minimal create payload yields a
+    # high-quality, working agent. Voice = ElevenLabs "Sarah" (must be an
+    # ElevenLabs voice ID when tts_provider=elevenlabs).
+    voice: str = Field("EXAVITQu4vr4xnSDxMaL", description="TTS voice ID (ElevenLabs voice ID, or alloy/echo/... for OpenAI TTS)")
     language: str = Field("en-US", description="BCP-47 language code")
     knowledge_base_ids: List[str] = Field(default_factory=list, description="Linked KB collection IDs")
     llm_model: str = Field("gpt-4o-mini", description="LLM backend model")
-    stt_provider: str = Field("whisper", description="STT: whisper, deepgram, google")
-    tts_provider: str = Field("openai", description="TTS: openai, elevenlabs, azure")
+    stt_provider: str = Field("deepgram", description="STT: deepgram (recommended), whisper, google")
+    tts_provider: str = Field("elevenlabs", description="TTS: elevenlabs (recommended), openai, azure")
     max_call_duration: int = Field(600, description="Max call length in seconds")
     interruption_enabled: bool = Field(True, description="Allow user to interrupt agent")
     initial_message: Optional[str] = Field(
@@ -72,6 +75,46 @@ class AgentResponse(BaseModel):
     webhook_url: Optional[str]
     created_at: datetime
     updated_at: datetime
+
+
+@router.get("/options")
+async def agent_options():
+    """
+    Metadata for building the 'create/edit agent' UI: valid provider choices,
+    LLM models, and the live list of ElevenLabs voices (id + name) so the UI
+    can render a real voice-picker instead of hardcoding IDs.
+    """
+    import os
+    import aiohttp
+
+    voices = []
+    el_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    if el_key:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    "https://api.elevenlabs.io/v1/voices",
+                    headers={"xi-api-key": el_key},
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        voices = [
+                            {"id": v["voice_id"], "name": v["name"],
+                             "category": v.get("category")}
+                            for v in data.get("voices", [])
+                        ]
+        except Exception:
+            pass  # voices is best-effort; UI can still work without it
+
+    return {
+        "stt_providers": ["deepgram", "whisper", "google"],
+        "tts_providers": ["elevenlabs", "openai", "azure"],
+        "llm_models": ["gpt-4o-mini", "gpt-4o"],
+        "openai_voices": ["alloy", "echo", "fable", "onyx", "nova", "shimmer"],
+        "elevenlabs_voices": voices,
+        "languages": ["en-US", "en-IN", "en-GB", "hi-IN"],
+    }
 
 
 @router.post("", response_model=AgentResponse, status_code=201)

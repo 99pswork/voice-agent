@@ -53,14 +53,18 @@ class ElevenLabsTTS(TTSProvider):
         if not self.api_key:
             raise RuntimeError("ELEVENLABS_API_KEY not configured")
 
+        # optimize_streaming_latency=4 (max) for the lowest first-audio latency;
+        # paired with the Flash model this is the fastest ElevenLabs config for
+        # live phone turns.
         url = (
             f"wss://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}/stream-input"
             f"?model_id={self.model}&output_format=pcm_16000"
+            f"&optimize_streaming_latency=4"
         )
         async with websockets.connect(url) as ws:
             await ws.send(json.dumps({
                 "text": " ",
-                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "speed": 1.0},
+                "voice_settings": {"stability": 0.4, "similarity_boost": 0.7},
                 "xi_api_key": self.api_key,
             }))
             await ws.send(json.dumps({"text": text + " ", "try_trigger_generation": True}))
@@ -97,6 +101,13 @@ class OpenAITTS(TTSProvider):
 
     async def synthesize(self, text: str) -> AsyncGenerator[bytes, None]:
         self._cancel_event.clear()
+        import audioop
+
+        # ratecv is stateful: carry `rate_state` across chunks for a clean,
+        # click-free 24kHz->16kHz conversion. `leftover` holds a trailing odd
+        # byte so we never feed ratecv a partial 16-bit sample.
+        rate_state = None
+        leftover = b""
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -106,21 +117,23 @@ class OpenAITTS(TTSProvider):
                     "model": "tts-1",
                     "voice": self.voice,
                     "input": text,
-                    "response_format": "pcm",  # 24kHz raw PCM
+                    "response_format": "pcm",  # 24kHz raw PCM, mono, 16-bit
                 },
             ) as r:
                 async for chunk in r.content.iter_chunked(3200):
                     if self._cancel_event.is_set():
                         break
-                    # OpenAI returns 24kHz; downsample to the agent's 16kHz PCM
-                    yield self._downsample_24k_to_16k(chunk)
-
-    @staticmethod
-    def _downsample_24k_to_16k(pcm: bytes) -> bytes:
-        """Quick 3:2 downsample. For production use scipy.signal.resample_poly."""
-        import audioop
-        converted, _ = audioop.ratecv(pcm, 2, 1, 24000, 16000, None)
-        return converted
+                    data = leftover + chunk
+                    # keep only a whole number of 2-byte frames
+                    usable = len(data) - (len(data) % 2)
+                    leftover = data[usable:]
+                    data = data[:usable]
+                    if not data:
+                        continue
+                    converted, rate_state = audioop.ratecv(
+                        data, 2, 1, 24000, 16000, rate_state
+                    )
+                    yield converted
 
     async def stop_current(self):
         self._cancel_event.set()

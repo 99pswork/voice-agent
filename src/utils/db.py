@@ -31,7 +31,10 @@ async def init_db():
 
     db_name = os.getenv("MONGO_DB", "voice_agent")
     try:
-        _client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=3000)
+        # 10s: Atlas (mongodb+srv) needs time for DNS SRV resolution + TLS on a
+        # cold start; 3s was too tight and caused a false "unreachable" fallback.
+        timeout_ms = int(os.getenv("MONGO_TIMEOUT_MS", "10000"))
+        _client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=timeout_ms)
         # Force an actual connection check so we fail fast, not on first query.
         await _client.admin.command("ping")
         _db = _client[db_name]

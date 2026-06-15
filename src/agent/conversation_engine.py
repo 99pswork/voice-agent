@@ -26,9 +26,22 @@ class ConversationEngine:
     def __init__(self, config: VoiceAgentConfig, variables: Optional[Dict] = None):
         self.config = config
         self.variables = variables or {}
+        # history: role/content only — this is what we send to the LLM.
         self.history: List[Dict[str, str]] = []
+        # transcript: the same turns PLUS a timestamp, for the stored record.
+        self.transcript: List[Dict] = []
         self.llm = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         self.vector_store = VectorStoreManager.instance()
+
+    def _record_turn(self, role: str, content: str):
+        """Append a turn to both the LLM history and the timestamped transcript."""
+        from datetime import datetime, timezone
+        self.history.append({"role": role, "content": content})
+        self.transcript.append({
+            "role": role,
+            "content": content,
+            "at": datetime.now(timezone.utc).isoformat(),
+        })
 
     def _render_template(self, text: str) -> str:
         """Replace {variable} placeholders with values."""
@@ -92,6 +105,9 @@ Use the following information to answer questions accurately. If the user's ques
     ) -> str:
         """Non-streaming reply (used for testing endpoint)."""
         history = history if history is not None else self.history
+        max_msgs = int(os.getenv("LLM_HISTORY_MESSAGES", "20"))
+        if max_msgs > 0:
+            history = history[-max_msgs:]
         retrieved = await self._retrieve_context(user_message)
         system_prompt = self._build_system_prompt(retrieved)
 
@@ -107,8 +123,8 @@ Use the following information to answer questions accurately. If the user's ques
         )
         reply = completion.choices[0].message.content.strip()
 
-        self.history.append({"role": "user", "content": user_message})
-        self.history.append({"role": "assistant", "content": reply})
+        self._record_turn("user", user_message)
+        self._record_turn("assistant", reply)
         return reply
 
     async def stream_response(
@@ -121,8 +137,13 @@ Use the following information to answer questions accurately. If the user's ques
         retrieved = await self._retrieve_context(user_message)
         system_prompt = self._build_system_prompt(retrieved)
 
+        # Cap how much history we send to the LLM: keep the full transcript in
+        # self.history (for the record) but only send the most recent N turns,
+        # so long calls don't blow up latency/token cost or hit context limits.
+        max_msgs = int(os.getenv("LLM_HISTORY_MESSAGES", "20"))
+        recent = self.history[-max_msgs:] if max_msgs > 0 else self.history
         messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(self.history)
+        messages.extend(recent)
         messages.append({"role": "user", "content": user_message})
 
         full_reply = ""
@@ -140,12 +161,21 @@ Use the following information to answer questions accurately. If the user's ques
                 full_reply += delta
                 yield delta
 
-        self.history.append({"role": "user", "content": user_message})
-        self.history.append({"role": "assistant", "content": full_reply.strip()})
+        self._record_turn("user", user_message)
+        self._record_turn("assistant", full_reply.strip())
 
     def should_end_call(self, user_message: str) -> bool:
+        import re
         msg = user_message.lower().strip()
-        return any(phrase in msg for phrase in self.config.end_call_phrases)
+        # Match end phrases as whole words only (so "bye" doesn't fire on noise
+        # like "by the way"), and require the utterance to be short & focused —
+        # a real "goodbye", not a passing mention inside a longer sentence.
+        if len(msg.split()) > 6:
+            return False
+        for phrase in self.config.end_call_phrases:
+            if re.search(rf"\b{re.escape(phrase)}\b", msg):
+                return True
+        return False
 
     def should_transfer(self, user_message: str) -> bool:
         triggers = ["speak to human", "talk to agent", "real person", "transfer me", "manager"]
@@ -156,5 +186,6 @@ Use the following information to answer questions accurately. If the user's ques
             return None
         return self._render_template(self.config.initial_message)
 
-    def get_transcript(self) -> List[Dict[str, str]]:
-        return self.history.copy()
+    def get_transcript(self) -> List[Dict]:
+        """Timestamped transcript turns for the stored call record."""
+        return self.transcript.copy()

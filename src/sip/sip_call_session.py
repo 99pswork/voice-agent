@@ -10,6 +10,7 @@ end/transfer intent detection, accumulating a transcript on the call record.
 """
 import asyncio
 import logging
+import os
 from typing import Optional
 from datetime import datetime
 
@@ -44,6 +45,7 @@ class SIPCallSession:
         self.started_at = datetime.utcnow()
         self._stopped = False
         self._is_speaking = False
+        self._responding = False  # a turn (LLM+TTS) is in flight
         self._max_duration_task: Optional[asyncio.Task] = None
         self._connected = asyncio.Event()
 
@@ -77,11 +79,30 @@ class SIPCallSession:
 
         self.stt.on_partial = self._on_partial_transcript
         self.stt.on_final = self._on_final_transcript
-        await self.stt.start()
 
+        # Settle delay after answer so the RTP path is flowing AND the callee
+        # has the phone to their ear before the greeting starts (without enough
+        # delay the opener plays too early and is missed). Tunable via env.
+        await asyncio.sleep(float(os.getenv("OPENER_DELAY_SEC", "1.5")))
+
+        # Speak the opener and connect STT CONCURRENTLY. The opener text is
+        # fixed and doesn't depend on STT, so there's no reason to make the
+        # caller wait for the Deepgram WebSocket to connect before they hear it.
         opener = self.engine.get_initial_message()
-        if opener:
-            await self._speak(opener)
+        speak_task = asyncio.create_task(self._speak(opener)) if opener else None
+
+        try:
+            await self.stt.start()
+        except Exception:
+            logger.exception(f"SIP call {self.call_id}: STT failed to start; ending call")
+            self.outcome = "stt_init_failed"
+            if speak_task:
+                await speak_task
+            await self._end_call_gracefully("Sorry, we're having a technical issue. Goodbye.")
+            return
+
+        if speak_task:
+            await speak_task
 
         self._max_duration_task = asyncio.create_task(self._duration_watchdog())
         logger.info(f"SIP call {self.call_id} session started")
@@ -120,22 +141,36 @@ class SIPCallSession:
         asyncio.run_coroutine_threadsafe(self._handle_user_input(text), self.loop)
 
     async def _handle_user_input(self, user_text: str):
-        logger.info(f"SIP call {self.call_id} USER: {user_text}")
-
-        if self.engine.should_end_call(user_text):
-            self.outcome = "user_ended"
-            await self._end_call_gracefully("Thank you, have a great day. Goodbye.")
+        # Serialize turns: if the agent is already responding, treat this as a
+        # barge-in (stop talking) and let the new input through. This prevents
+        # the overlapping/duplicate replies seen with eager transcripts.
+        if self._is_speaking:
+            await self._interrupt_speech()
+        if self._responding:
+            logger.debug(f"SIP call {self.call_id}: dropping overlapping input")
             return
+        self._responding = True
+        try:
+            logger.info(f"SIP call {self.call_id} USER: {user_text}")
 
-        if self.engine.should_transfer(user_text) and self.config.transfer_number:
-            await self._speak("Sure, transferring you to a human agent now. Please hold.")
-            await asyncio.sleep(0.5)
-            # Direct SIP transfer = blind REFER to the transfer target.
-            self.outcome = "transferred"
-            await self._transfer(self.config.transfer_number)
-            return
+            if self.engine.should_end_call(user_text):
+                self.outcome = "user_ended"
+                await self._end_call_gracefully("Thank you, have a great day. Goodbye.")
+                return
 
-        await self._speak_streaming(user_text)
+            if self.engine.should_transfer(user_text) and self.config.transfer_number:
+                await self._speak("Sure, transferring you to a human agent now. Please hold.")
+                await asyncio.sleep(0.5)
+                self.outcome = "transferred"
+                await self._transfer(self.config.transfer_number)
+                return
+
+            await self._speak_streaming(user_text)
+        except Exception:
+            # One bad turn must never kill the call.
+            logger.exception(f"SIP call {self.call_id}: error handling user input")
+        finally:
+            self._responding = False
 
     async def _speak(self, text: str):
         self._is_speaking = True
@@ -144,6 +179,8 @@ class SIPCallSession:
                 if self._stopped:
                     break
                 self._send(chunk)
+        except Exception:
+            logger.exception(f"SIP call {self.call_id}: TTS error during _speak")
         finally:
             self._is_speaking = False
         logger.info(f"SIP call {self.call_id} AGENT: {text}")
@@ -154,23 +191,44 @@ class SIPCallSession:
         full_reply = ""
         sentence_endings = (".", "!", "?", "।")
         try:
+            import time as _t
+            t0 = _t.monotonic()
+            first_token_logged = False
+            first_audio_logged = False
+            first_flush = True
             async for token in self.engine.stream_response(user_text):
                 if self._stopped or not self._is_speaking:
                     break
+                if not first_token_logged:
+                    logger.info(f"SIP call {self.call_id} LATENCY: LLM first token +{(_t.monotonic()-t0)*1000:.0f}ms")
+                    first_token_logged = True
                 buffer += token
                 full_reply += token
-                if any(buffer.rstrip().endswith(e) for e in sentence_endings):
+                stripped = buffer.rstrip()
+                # Latency win: speak the FIRST chunk as soon as a clause is ready
+                # (sentence end, or a comma after enough words) instead of waiting
+                # for a full sentence — the agent starts talking ~1-2s sooner.
+                flush = any(stripped.endswith(e) for e in sentence_endings)
+                if first_flush and not flush:
+                    flush = stripped.endswith((",", ";", ":")) and len(stripped.split()) >= 4
+                if flush:
                     sentence = buffer.strip()
                     buffer = ""
+                    first_flush = False
                     async for chunk in self.tts.synthesize(sentence):
                         if self._stopped or not self._is_speaking:
                             break
+                        if not first_audio_logged:
+                            logger.info(f"SIP call {self.call_id} LATENCY: TTS first audio +{(_t.monotonic()-t0)*1000:.0f}ms")
+                            first_audio_logged = True
                         self._send(chunk)
             if buffer.strip() and self._is_speaking:
                 async for chunk in self.tts.synthesize(buffer.strip()):
                     if self._stopped:
                         break
                     self._send(chunk)
+        except Exception:
+            logger.exception(f"SIP call {self.call_id}: LLM/TTS error during reply")
         finally:
             self._is_speaking = False
         logger.info(f"SIP call {self.call_id} AGENT: {full_reply.strip()}")

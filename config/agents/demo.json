@@ -2,6 +2,8 @@
   "name": "Demo Agent",
   "base_instructions": "You are a friendly assistant making a short test call on behalf of the team. Greet the person warmly, confirm they can hear you clearly, answer any quick question briefly, and then thank them and say goodbye. Keep every reply to one or two short spoken sentences.",
   "initial_message": "Hi! This is an AI test call. Can you hear me clearly?",
-  "voice": "alloy",
+  "stt_provider": "deepgram",
+  "tts_provider": "elevenlabs",
+  "voice": "EXAVITQu4vr4xnSDxMaL",
   "language": "en-US"
 }

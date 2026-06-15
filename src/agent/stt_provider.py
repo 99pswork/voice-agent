@@ -53,11 +53,19 @@ class DeepgramSTT(STTProvider):
             raise RuntimeError("DEEPGRAM_API_KEY not configured")
 
         self._loop = asyncio.get_event_loop()
+        # nova-2-phonecall: tuned for 8/16kHz telephony, lowest latency.
+        # endpointing=250ms: finalize a turn quickly after the caller stops,
+        # so the agent starts replying sooner (less perceived lag).
+        model = os.getenv("DEEPGRAM_MODEL", "nova-2-phonecall")
+        # endpointing=150ms: detect end-of-speech faster so the agent starts
+        # thinking sooner. Lower risks cutting off slow talkers; 150 is a good
+        # phone default.
         url = (
             "wss://api.deepgram.com/v1/listen"
             f"?encoding=linear16&sample_rate=16000&channels=1"
-            f"&language={self.language}&punctuate=true&interim_results=true"
-            f"&endpointing=300&vad_events=true"
+            f"&model={model}&language={self.language}"
+            f"&punctuate=true&smart_format=true&interim_results=true"
+            f"&endpointing=150&vad_events=true"
         )
         headers = {"Authorization": f"Token {self.api_key}"}
         self.ws = await websockets.connect(url, extra_headers=headers)
@@ -135,8 +143,18 @@ class WhisperSTT(STTProvider):
             self._buffer.clear()
             asyncio.run_coroutine_threadsafe(self._transcribe(chunk), self._loop)
 
+    # Whisper commonly "hallucinates" these on silence/noise — drop them.
+    _HALLUCINATIONS = {
+        "you", "thank you", "thank you.", "bye", "bye.", "bye bye",
+        "thanks for watching", "thanks for watching!", ".", "okay", "okay.",
+    }
+
     async def _transcribe(self, pcm: bytes):
-        import io, wave, aiohttp
+        import io, wave, aiohttp, audioop
+        # Silence gate: skip near-silent buffers so Whisper isn't fed noise
+        # (which it tends to transcribe as phantom words like "Bye").
+        if audioop.rms(pcm, 2) < 350:
+            return
         # Wrap as WAV
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
@@ -160,7 +178,7 @@ class WhisperSTT(STTProvider):
                 if r.status == 200:
                     data = await r.json()
                     text = data.get("text", "").strip()
-                    if text and self.on_final:
+                    if text and text.lower() not in self._HALLUCINATIONS and self.on_final:
                         self.on_final(text)
 
 
