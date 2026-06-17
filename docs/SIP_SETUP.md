@@ -133,7 +133,7 @@ If you see `code=408` (timeout), the agent can't reach `15.207.28.98:7719`.
 # (a) create a voice agent
 curl -X POST localhost:8000/api/v1/agents -H 'Content-Type: application/json' -d '{
   "name": "Test Agent",
-  "base_instructions": "You are a friendly assistant making a test call. Greet the person, confirm they can hear you, then say goodbye.",
+  "prompt": "You are a friendly assistant making a test call. Greet the person, confirm they can hear you, then say goodbye.",
   "initial_message": "Hi! This is an AI test call. Can you hear me clearly?",
   "stt_provider": "deepgram",
   "tts_provider": "elevenlabs",

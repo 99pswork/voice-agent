@@ -8,7 +8,7 @@ file is one agent; its `id` is the filename stem (e.g. config/agents/demo.json
     config/agents/demo.json
     {
       "name": "Demo Agent",
-      "base_instructions": "You are a friendly assistant on a test call...",
+      "prompt": "You are a friendly assistant on a test call...",
       "initial_message": "Hi! This is an AI test call. Can you hear me?"
     }
 
@@ -25,7 +25,7 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Defaults so a minimal agent file (just name + base_instructions) still
+# Defaults so a minimal agent file (just name + prompt) still
 # satisfies VoiceAgentConfig and the AgentResponse model.
 _DEFAULTS = {
     "voice": "alloy",
@@ -52,6 +52,9 @@ def _load_file(path: Path) -> Dict:
         data = json.load(f)
     # id defaults to the filename stem if not set inside the file
     data.setdefault("id", path.stem)
+    # Accept the API field name `prompt` and map to internal base_instructions.
+    if "prompt" in data and "base_instructions" not in data:
+        data["base_instructions"] = data.pop("prompt")
     for k, v in _DEFAULTS.items():
         data.setdefault(k, v)
     # Timestamps from the file's mtime so AgentResponse validates.

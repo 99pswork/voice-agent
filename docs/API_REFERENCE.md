@@ -4,7 +4,7 @@ Base URL: `http://<host>:8000/api/v1`
 All request/response bodies are JSON unless noted (file upload is multipart).
 
 This backend already supports the full multi-agent workflow:
-**many agents, each with its own prompt, voice, and linked knowledge bases.**
+**many agents, each with its own prompt and linked knowledge bases.**
 The UI just needs to call these endpoints. Data persists in MongoDB.
 
 Interactive docs (auto-generated, try requests live): `http://<host>:8000/docs`
@@ -13,35 +13,29 @@ Interactive docs (auto-generated, try requests live): `http://<host>:8000/docs`
 
 ## 1. Agents
 
-An agent = a persona: a prompt (`base_instructions`), a voice, STT/TTS choice,
-and zero or more linked knowledge bases.
+An agent = a persona: a `prompt` plus zero or more linked knowledge bases.
+Voice and the STT/TTS engines use fixed, high-quality defaults and are **not**
+user-configurable.
 
 ### Options for the create/edit form
-`GET /agents/options` — returns dropdown data for the UI: valid `stt_providers`,
-`tts_providers`, `llm_models`, `languages`, OpenAI voice names, and the live
-list of **ElevenLabs voices** (`{id, name, category}`). Use this to build the
-voice picker instead of hardcoding IDs.
+`GET /agents/options` — returns dropdown data for the UI: `llm_models` and
+`languages`. (Voice/STT/TTS are fixed defaults, so they aren't returned.)
 
 ### Create agent
 `POST /agents`
 ```json
 {
   "name": "Sales Bot",
-  "base_instructions": "You are Riya, a friendly sales agent. Use the knowledge base for pricing.",
+  "prompt": "You are Riya, a friendly sales agent. Use the knowledge base for pricing.",
   "initial_message": "Hi! I can help with our plans.",
   "knowledge_base_ids": ["kb_abc123"],
-  "voice": "EXAVITQu4vr4xnSDxMaL",
-  "stt_provider": "deepgram",
-  "tts_provider": "elevenlabs",
-  "language": "en-US",
-  "max_call_duration": 600,
-  "interruption_enabled": true,
-  "transfer_number": null,
-  "webhook_url": null
+  "language": "en-US"
 }
 ```
 Returns the created agent with its generated `id` (e.g. `agent_xxx`).
-Only `name` and `base_instructions` are required; the rest have sensible defaults.
+**Only `name` and `prompt` are required** (`prompt` ≥ 10 chars); the rest have
+sensible defaults. The response includes a `voice` field for info, but it is
+always the default and cannot be set.
 
 ### List agents
 `GET /agents?limit=50&offset=0` → array of agents.
@@ -49,12 +43,14 @@ Only `name` and `base_instructions` are required; the rest have sensible default
 ### Get one agent
 `GET /agents/{agent_id}`
 
-### Update agent (edit prompt, voice, linked KBs, etc.)
+### Update agent (edit the prompt, linked KBs, etc.)
 `PATCH /agents/{agent_id}` — send only the fields you want to change:
 ```json
-{ "base_instructions": "New prompt text...", "knowledge_base_ids": ["kb_abc123","kb_def456"] }
+{ "prompt": "New prompt text...", "knowledge_base_ids": ["kb_abc123","kb_def456"] }
 ```
 This is the endpoint behind the UI's "edit prompt" / "configure agent".
+(Editable: `name`, `prompt`, `language`, `knowledge_base_ids`,
+`initial_message`, `transfer_number`, `webhook_url`.)
 
 ### Delete agent
 `DELETE /agents/{agent_id}` → 204
@@ -183,7 +179,7 @@ There's also an inbound trigger: `POST /webhooks/trigger-call` (same body as
 5. `POST /calls/outbound` to call
 
 **Edit an existing agent's prompt or knowledge:**
-- `PATCH /agents/{id}` with the new `base_instructions` and/or `knowledge_base_ids`
+- `PATCH /agents/{id}` with the new `prompt` and/or `knowledge_base_ids`
 - add more KB data anytime via `POST /knowledge-base/{kb_id}/upload`
 
 ---

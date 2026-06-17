@@ -1,5 +1,6 @@
 """
-Agent CRUD endpoints - Create voice agents with custom instructions and knowledge base
+Agent CRUD endpoints - create voice agents with a prompt and knowledge base.
+API field `prompt` maps to the internal/stored `base_instructions`.
 """
 from typing import Optional, List
 from uuid import uuid4
@@ -12,18 +13,27 @@ from agent.voice_agent_config import VoiceAgentConfig
 
 router = APIRouter()
 
+# Fixed default voice (ElevenLabs "Sarah"). Voice is not user-configurable.
+DEFAULT_VOICE = "EXAVITQu4vr4xnSDxMaL"
+
+
+def _to_response(doc: dict) -> "AgentResponse":
+    """Map a stored agent doc to the API response (base_instructions -> prompt)."""
+    d = dict(doc)
+    d.pop("_id", None)
+    if "prompt" not in d and "base_instructions" in d:
+        d["prompt"] = d["base_instructions"]
+    d.setdefault("voice", DEFAULT_VOICE)
+    return AgentResponse(**{k: v for k, v in d.items() if k in AgentResponse.model_fields})
+
 
 class AgentCreate(BaseModel):
     name: str = Field(..., description="Agent display name")
-    base_instructions: str = Field(
+    prompt: str = Field(
         ...,
-        description="System prompt / persona / behavior rules for the agent",
+        description="The agent's prompt — its persona, behavior, and instructions",
         min_length=10,
     )
-    # Default to the production voice stack so a minimal create payload yields a
-    # high-quality, working agent. Voice = ElevenLabs "Sarah" (must be an
-    # ElevenLabs voice ID when tts_provider=elevenlabs).
-    voice: str = Field("EXAVITQu4vr4xnSDxMaL", description="TTS voice ID (ElevenLabs voice ID, or alloy/echo/... for OpenAI TTS)")
     language: str = Field("en-US", description="BCP-47 language code")
     knowledge_base_ids: List[str] = Field(default_factory=list, description="Linked KB collection IDs")
     llm_model: str = Field("gpt-4o-mini", description="LLM backend model")
@@ -48,8 +58,7 @@ class AgentCreate(BaseModel):
 
 class AgentUpdate(BaseModel):
     name: Optional[str] = None
-    base_instructions: Optional[str] = None
-    voice: Optional[str] = None
+    prompt: Optional[str] = None
     language: Optional[str] = None
     knowledge_base_ids: Optional[List[str]] = None
     initial_message: Optional[str] = None
@@ -60,8 +69,8 @@ class AgentUpdate(BaseModel):
 class AgentResponse(BaseModel):
     id: str
     name: str
-    base_instructions: str
-    voice: str
+    prompt: str
+    voice: str  # informational; uses the default voice (not user-settable)
     language: str
     knowledge_base_ids: List[str]
     llm_model: str
@@ -80,39 +89,11 @@ class AgentResponse(BaseModel):
 @router.get("/options")
 async def agent_options():
     """
-    Metadata for building the 'create/edit agent' UI: valid provider choices,
-    LLM models, and the live list of ElevenLabs voices (id + name) so the UI
-    can render a real voice-picker instead of hardcoding IDs.
+    Metadata for building the 'create/edit agent' UI: LLM models and languages.
+    Voice/STT/TTS are fixed defaults and not user-configurable.
     """
-    import os
-    import aiohttp
-
-    voices = []
-    el_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
-    if el_key:
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    "https://api.elevenlabs.io/v1/voices",
-                    headers={"xi-api-key": el_key},
-                    timeout=aiohttp.ClientTimeout(total=8),
-                ) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        voices = [
-                            {"id": v["voice_id"], "name": v["name"],
-                             "category": v.get("category")}
-                            for v in data.get("voices", [])
-                        ]
-        except Exception:
-            pass  # voices is best-effort; UI can still work without it
-
     return {
-        "stt_providers": ["deepgram", "whisper", "google"],
-        "tts_providers": ["elevenlabs", "openai", "azure"],
         "llm_models": ["gpt-4o-mini", "gpt-4o"],
-        "openai_voices": ["alloy", "echo", "fable", "onyx", "nova", "shimmer"],
-        "elevenlabs_voices": voices,
         "languages": ["en-US", "en-IN", "en-GB", "hi-IN"],
     }
 
@@ -126,8 +107,7 @@ async def create_agent(payload: AgentCreate, db=Depends(get_db)):
     ```json
     {
       "name": "Sales Bot - Premium Plan",
-      "base_instructions": "You are Riya, a polite sales agent for ABC Corp...",
-      "voice": "nova",
+      "prompt": "You are Riya, a polite sales agent for ABC Corp...",
       "language": "en-IN",
       "knowledge_base_ids": ["kb_pricing_v2"],
       "initial_message": "Hi, am I speaking with {customer_name}?"
@@ -145,23 +125,29 @@ async def create_agent(payload: AgentCreate, db=Depends(get_db)):
     agent_id = f"agent_{uuid4().hex[:12]}"
     now = datetime.utcnow()
 
+    data = payload.model_dump()
+    # Map the API field `prompt` to the internal `base_instructions`, and always
+    # use the default voice (voice is not user-configurable).
+    data["base_instructions"] = data.pop("prompt")
+    data["voice"] = DEFAULT_VOICE
+
     record = {
         "id": agent_id,
-        **payload.model_dump(),
+        **data,
         "created_at": now,
         "updated_at": now,
     }
     await db.agents.insert_one(record)
-    return AgentResponse(**record)
+    return _to_response(record)
 
 
 @router.get("", response_model=List[AgentResponse])
 async def list_agents(db=Depends(get_db), limit: int = 50, offset: int = 0):
     if db is None:
         from utils.agent_store import list_agents as file_list
-        return [AgentResponse(**a) for a in file_list()[offset:offset + limit]]
+        return [_to_response(a) for a in file_list()[offset:offset + limit]]
     cursor = db.agents.find({}).skip(offset).limit(limit)
-    return [AgentResponse(**doc) async for doc in cursor]
+    return [_to_response(doc) async for doc in cursor]
 
 
 @router.get("/{agent_id}", response_model=AgentResponse)
@@ -173,7 +159,7 @@ async def get_agent(agent_id: str, db=Depends(get_db)):
         doc = await db.agents.find_one({"id": agent_id})
     if not doc:
         raise HTTPException(404, f"Agent {agent_id} not found")
-    return AgentResponse(**doc)
+    return _to_response(doc)
 
 
 @router.patch("/{agent_id}", response_model=AgentResponse)
@@ -181,6 +167,9 @@ async def update_agent(agent_id: str, payload: AgentUpdate, db=Depends(get_db)):
     if db is None:
         raise HTTPException(503, "No database configured. Edit config/agents/<id>.json directly.")
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    # Map the API field `prompt` to the stored `base_instructions`.
+    if "prompt" in updates:
+        updates["base_instructions"] = updates.pop("prompt")
     updates["updated_at"] = datetime.utcnow()
 
     result = await db.agents.find_one_and_update(
@@ -188,7 +177,7 @@ async def update_agent(agent_id: str, payload: AgentUpdate, db=Depends(get_db)):
     )
     if not result:
         raise HTTPException(404, f"Agent {agent_id} not found")
-    return AgentResponse(**result)
+    return _to_response(result)
 
 
 @router.delete("/{agent_id}", status_code=204)
